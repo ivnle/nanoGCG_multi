@@ -166,24 +166,24 @@ def filter_ids(ids: Tensor, tokenizer: transformers.PreTrainedTokenizer):
 class GCG:
     def __init__(
         self, 
-        model: transformers.PreTrainedModel,
+        models: transformers.PreTrainedModel,
         tokenizer: transformers.PreTrainedTokenizer,
         config: GCGConfig,
     ):
-        self.model = model
+        self.models = models
         self.tokenizer = tokenizer
         self.config = config
 
-        self.embedding_layer = model.get_input_embeddings()
-        self.not_allowed_ids = None if config.allow_non_ascii else get_nonascii_toks(tokenizer, device=model.device)
+        self.embedding_layers = [m.get_input_embeddings() for m in models]
+        self.not_allowed_ids = None if config.allow_non_ascii else get_nonascii_toks(tokenizer, device=models[0].device)
         self.prefix_cache = None
 
         self.stop_flag = False
 
-        if model.dtype in (torch.float32, torch.float64):
-            logger.warning(f"Model is in {model.dtype}. Use a lower precision data type, if possible, for much faster optimization.")
+        if models[0].dtype in (torch.float32, torch.float64):
+            logger.warning(f"Model is in {models[0].dtype}. Use a lower precision data type, if possible, for much faster optimization.")
 
-        if model.device == torch.device("cpu"):
+        if models[0].device == torch.device("cpu"):
             logger.warning("Model is on the CPU. Use a hardware accelerator for faster optimization.")
 
         if not tokenizer.chat_template:
@@ -193,9 +193,10 @@ class GCG:
     def run(
         self,
         messages: Union[str, List[dict]],
-        target: str,
+        targets: List[str],
+        neg_targets: List[str], # TODO
     ) -> GCGResult:
-        model = self.model
+        models = self.models
         tokenizer = self.tokenizer
         config = self.config
 
@@ -218,24 +219,46 @@ class GCG:
             template = template.replace(tokenizer.bos_token, "")
         before_str, after_str = template.split("{optim_str}")
 
-        target = " " + target if config.add_space_before_target else target
+        # target = " " + target if config.add_space_before_target else target
+        if config.add_space_before_target:
+            targets = [" " + t for t in targets]
 
         # Tokenize everything that doesn't get optimized
-        before_ids = tokenizer([before_str], padding=False, return_tensors="pt")["input_ids"].to(model.device, torch.int64)
-        after_ids = tokenizer([after_str], add_special_tokens=False, return_tensors="pt")["input_ids"].to(model.device, torch.int64)
-        target_ids = tokenizer([target], add_special_tokens=False, return_tensors="pt")["input_ids"].to(model.device, torch.int64)
+        before_ids = tokenizer([before_str], padding=False, return_tensors="pt")["input_ids"].to(models[0].device, torch.int64)
+        after_ids = tokenizer([after_str], add_special_tokens=False, return_tensors="pt")["input_ids"].to(models[0].device, torch.int64)
+        # target_ids = tokenizer([target], add_special_tokens=False, return_tensors="pt")["input_ids"].to(model.device, torch.int64)
+        
+        target_idss = []
+        for i, t in enumerate(targets):
+            _ = tokenizer([t], add_special_tokens=False, return_tensors="pt")["input_ids"].to(models[i].device, torch.int64)
+            target_idss.append(_)
 
         # Embed everything that doesn't get optimized
-        embedding_layer = self.embedding_layer
-        before_embeds, after_embeds, target_embeds = [embedding_layer(ids) for ids in (before_ids, after_ids, target_ids)]
+        embedding_layers = self.embedding_layers
+        # before_embeds, after_embeds, target_embeds = [embedding_layer(ids) for ids in (before_ids, after_ids, target_ids)]
+
+        before_embeds, after_embeds, target_embeds = [], [], []
+        for i, e in enumerate(embedding_layers):
+            before_embeds.append(e(before_ids))
+            after_embeds.append(e(after_ids))
+            target_embeds.append(e(target_idss[i]))
+
 
         # Compute the KV Cache for tokens that appear before the optimized tokens
+        # if config.use_prefix_cache:
+        #     with torch.no_grad():
+        #         output = model(inputs_embeds=before_embeds, use_cache=True)
+        #         self.prefix_cache = output.past_key_values
+
         if config.use_prefix_cache:
-            with torch.no_grad():
-                output = model(inputs_embeds=before_embeds, use_cache=True)
-                self.prefix_cache = output.past_key_values
+            # TODO figure out where this is used               
+            self.prefix_cache = []
+            for i, m in enumerate(models):
+                with torch.no_grad():
+                    output = m(inputs_embeds=before_embeds[i], use_cache=True)
+                    self.prefix_cache.append(output.past_key_values) 
         
-        self.target_ids = target_ids
+        self.target_idss = target_idss
         self.before_embeds = before_embeds
         self.after_embeds = after_embeds
         self.target_embeds = target_embeds
@@ -248,7 +271,7 @@ class GCG:
         optim_strings = []
         
         for _ in tqdm(range(config.num_steps)):
-            # Compute the token gradient
+            # Compute the average token gradient across models
             optim_ids_onehot_grad = self.compute_token_gradient(optim_ids) 
 
             with torch.no_grad():
@@ -270,20 +293,26 @@ class GCG:
 
                 # Compute loss on all candidate sequences 
                 batch_size = new_search_width if config.batch_size is None else config.batch_size
-                if self.prefix_cache:
-                    input_embeds = torch.cat([
-                        embedding_layer(sampled_ids),
-                        after_embeds.repeat(new_search_width, 1, 1),
-                        target_embeds.repeat(new_search_width, 1, 1),
-                    ], dim=1)
-                else:
-                    input_embeds = torch.cat([
-                        before_embeds.repeat(new_search_width, 1, 1),
-                        embedding_layer(sampled_ids),
-                        after_embeds.repeat(new_search_width, 1, 1),
-                        target_embeds.repeat(new_search_width, 1, 1),
-                    ], dim=1)
-                loss = find_executable_batch_size(self.compute_candidates_loss, batch_size)(input_embeds)
+                _losses = []
+                for i, _ in enumerate(self.models):
+                    if self.prefix_cache:
+                        input_embeds = torch.cat([
+                            embedding_layers[i](sampled_ids),
+                            after_embeds[i].repeat(new_search_width, 1, 1),
+                            target_embeds[i].repeat(new_search_width, 1, 1),
+                        ], dim=1)
+                    else:
+                        input_embeds = torch.cat([
+                            before_embeds.repeat(new_search_width, 1, 1),
+                            embedding_layers[i](sampled_ids),
+                            after_embeds[i].repeat(new_search_width, 1, 1),
+                            target_embeds[i].repeat(new_search_width, 1, 1),
+                        ], dim=1)
+                    loss = find_executable_batch_size(self.compute_candidates_loss, batch_size)(input_embeds, i)
+                    _losses.append(loss)
+                
+                # Calculate the average loss across all models
+                loss = torch.mean(torch.stack(_losses), dim=0)
 
                 current_loss = loss.min().item()
                 optim_ids = sampled_ids[loss.argmin()].unsqueeze(0)
@@ -315,7 +344,7 @@ class GCG:
         return result
     
     def init_buffer(self) -> AttackBuffer:
-        model = self.model
+        model = self.models[0]
         tokenizer = self.tokenizer
         config = self.config
 
@@ -344,21 +373,26 @@ class GCG:
         true_buffer_size = max(1, config.buffer_size) 
 
         # Compute the loss on the initial buffer entries
-        if self.prefix_cache:
-            init_buffer_embeds = torch.cat([
-                self.embedding_layer(init_buffer_ids),
-                self.after_embeds.repeat(true_buffer_size, 1, 1),
-                self.target_embeds.repeat(true_buffer_size, 1, 1),
-            ], dim=1)
-        else:
-            init_buffer_embeds = torch.cat([
-                self.before_embeds.repeat(true_buffer_size, 1, 1),
-                self.embedding_layer(init_buffer_ids),
-                self.after_embeds.repeat(true_buffer_size, 1, 1),
-                self.target_embeds.repeat(true_buffer_size, 1, 1),
-            ], dim=1)
+        losses = []
+        for i, _ in enumerate(self.models):
+            if self.prefix_cache:
+                init_buffer_embeds = torch.cat([
+                    self.embedding_layers[i](init_buffer_ids),
+                    self.after_embeds[i].repeat(true_buffer_size, 1, 1),
+                    self.target_embeds[i].repeat(true_buffer_size, 1, 1),
+                ], dim=1)
+            else:
+                init_buffer_embeds = torch.cat([
+                    self.before_embeds[i].repeat(true_buffer_size, 1, 1),
+                    self.embedding_layers[i](init_buffer_ids),
+                    self.after_embeds[i].repeat(true_buffer_size, 1, 1),
+                    self.target_embeds[i].repeat(true_buffer_size, 1, 1),
+                ], dim=1)
 
-        init_buffer_losses = find_executable_batch_size(self.compute_candidates_loss, true_buffer_size)(init_buffer_embeds)
+            loss = find_executable_batch_size(self.compute_candidates_loss, true_buffer_size)(init_buffer_embeds, i)
+            losses.append(loss)
+        
+        init_buffer_losses = torch.mean(torch.stack(losses), dim=0)
 
         # Populate the buffer
         for i in range(true_buffer_size):
@@ -380,45 +414,53 @@ class GCG:
             optim_ids : Tensor, shape = (1, n_optim_ids)
                 the sequence of token ids that are being optimized 
         """
-        model = self.model
-        embedding_layer = self.embedding_layer
+        models = self.models
+        embedding_layers = self.embedding_layers
 
-        # Create the one-hot encoding matrix of our optimized token ids
-        optim_ids_onehot = torch.nn.functional.one_hot(optim_ids, num_classes=embedding_layer.num_embeddings)
-        optim_ids_onehot = optim_ids_onehot.to(model.device, model.dtype)
-        optim_ids_onehot.requires_grad_()
+        optim_ids_onehot_grads = []
 
-        # (1, num_optim_tokens, vocab_size) @ (vocab_size, embed_dim) -> (1, num_optim_tokens, embed_dim)
-        optim_embeds = optim_ids_onehot @ embedding_layer.weight
+        for i, model in enumerate(models):
+            embedding_layer = embedding_layers[i]
+            target_ids = self.target_idss[i]
+            # Create the one-hot encoding matrix of our optimized token ids
+            optim_ids_onehot = torch.nn.functional.one_hot(optim_ids, num_classes=embedding_layer.num_embeddings)
+            optim_ids_onehot = optim_ids_onehot.to(model.device, model.dtype)
+            optim_ids_onehot.requires_grad_()
 
-        if self.prefix_cache:
-            input_embeds = torch.cat([optim_embeds, self.after_embeds, self.target_embeds], dim=1)
-            output = model(inputs_embeds=input_embeds, past_key_values=self.prefix_cache)
-        else:
-            input_embeds = torch.cat([self.before_embeds, optim_embeds, self.after_embeds, self.target_embeds], dim=1)
-            output = model(inputs_embeds=input_embeds)
+            # (1, num_optim_tokens, vocab_size) @ (vocab_size, embed_dim) -> (1, num_optim_tokens, embed_dim)
+            optim_embeds = optim_ids_onehot @ embedding_layer.weight
 
-        logits = output.logits
+            if self.prefix_cache:
+                input_embeds = torch.cat([optim_embeds, self.after_embeds[i], self.target_embeds[i]], dim=1)
+                output = model(inputs_embeds=input_embeds, past_key_values=self.prefix_cache[i])
+            else:
+                input_embeds = torch.cat([self.before_embeds[i], optim_embeds, self.after_embeds[i], self.target_embeds[i]], dim=1)
+                output = model(inputs_embeds=input_embeds)
 
-        # Shift logits so token n-1 predicts token n
-        shift = input_embeds.shape[1] - self.target_ids.shape[1]
-        shift_logits = logits[..., shift-1:-1, :].contiguous() # (1, num_target_ids, vocab_size)
-        shift_labels = self.target_ids
+            logits = output.logits
 
-        if self.config.use_mellowmax:
-            label_logits = torch.gather(shift_logits, -1, shift_labels.unsqueeze(-1)).squeeze(-1)
-            loss = mellowmax(-label_logits, alpha=self.config.mellowmax_alpha, dim=-1)
-        else:
-            loss = torch.nn.functional.cross_entropy(shift_logits.view(-1, shift_logits.size(-1)), shift_labels.view(-1))
+            # Shift logits so token n-1 predicts token n
+            shift = input_embeds.shape[1] - target_ids.shape[1]
+            shift_logits = logits[..., shift-1:-1, :].contiguous() # (1, num_target_ids, vocab_size)
+            shift_labels = target_ids
 
-        optim_ids_onehot_grad = torch.autograd.grad(outputs=[loss], inputs=[optim_ids_onehot])[0]
+            if self.config.use_mellowmax:
+                label_logits = torch.gather(shift_logits, -1, shift_labels.unsqueeze(-1)).squeeze(-1)
+                loss = mellowmax(-label_logits, alpha=self.config.mellowmax_alpha, dim=-1)
+            else:
+                loss = torch.nn.functional.cross_entropy(shift_logits.view(-1, shift_logits.size(-1)), shift_labels.view(-1))
 
+            _ = torch.autograd.grad(outputs=[loss], inputs=[optim_ids_onehot])[0]
+            optim_ids_onehot_grads.append(_)
+
+        optim_ids_onehot_grad = torch.mean(torch.stack(optim_ids_onehot_grads), dim=0)
         return optim_ids_onehot_grad
     
     def compute_candidates_loss(
         self,
         search_batch_size: int, 
         input_embeds: Tensor, 
+        mi: int, # index of current model
     ) -> Tensor:
         """Computes the GCG loss on all candidate token id sequences.
 
@@ -438,17 +480,17 @@ class GCG:
 
                 if self.prefix_cache:
                     if not prefix_cache_batch or current_batch_size != search_batch_size:
-                        prefix_cache_batch = [[x.expand(current_batch_size, -1, -1, -1) for x in self.prefix_cache[i]] for i in range(len(self.prefix_cache))]
+                        prefix_cache_batch = [[x.expand(current_batch_size, -1, -1, -1) for x in self.prefix_cache[mi][i]] for i in range(len(self.prefix_cache[mi]))]
 
-                    outputs = self.model(inputs_embeds=input_embeds_batch, past_key_values=prefix_cache_batch)
+                    outputs = self.models[mi](inputs_embeds=input_embeds_batch, past_key_values=prefix_cache_batch)
                 else:
-                    outputs = self.model(inputs_embeds=input_embeds_batch)
+                    outputs = self.models[mi](inputs_embeds=input_embeds_batch)
 
                 logits = outputs.logits
 
-                tmp = input_embeds.shape[1] - self.target_ids.shape[1]
+                tmp = input_embeds.shape[1] - self.target_idss[mi].shape[1]
                 shift_logits = logits[..., tmp-1:-1, :].contiguous()
-                shift_labels = self.target_ids.repeat(current_batch_size, 1)
+                shift_labels = self.target_idss[mi].repeat(current_batch_size, 1)
                 
                 if self.config.use_mellowmax:
                     label_logits = torch.gather(shift_logits, -1, shift_labels.unsqueeze(-1)).squeeze(-1)
@@ -470,11 +512,12 @@ class GCG:
         return torch.cat(all_loss, dim=0)
 
 # A wrapper around the GCG `run` method that provides a simple API
-def run(
-    model: transformers.PreTrainedModel,
-    tokenizer: transformers.PreTrainedTokenizer,
+def run_multi(
+    models: List[transformers.PreTrainedModel],
+    tokenizer: transformers.PreTrainedTokenizer, # current implementation only supports shared tokenizer among models
     messages: Union[str, List[dict]],
-    target: str,
+    targets: List[str], # same len as models, the target for a given model
+    neg_targets: List[str], # same len as models, steer away from this string
     config: Optional[GCGConfig] = None, 
 ) -> GCGResult:
     """Generates a single optimized string using GCG. 
@@ -494,7 +537,7 @@ def run(
     
     logger.setLevel(getattr(logging, config.verbosity))
     
-    gcg = GCG(model, tokenizer, config)
-    result = gcg.run(messages, target)
+    gcg = GCG(models, tokenizer, config)
+    result = gcg.run(messages, targets, neg_targets)
     return result
     
